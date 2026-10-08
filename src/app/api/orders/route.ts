@@ -1,161 +1,151 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { adminDb } from '@/lib/firebase-admin';
-import { getAuthUser } from '@/lib/auth';
+import { z } from 'zod';
+import { db, fromCents, toCents } from '@/lib/db';
+import { agencyScope, assertAgencyAccess, isGlobalAdmin, requireUser } from '@/lib/auth';
+import { ApiError, intParam, pagination, readJson, route } from '@/lib/http';
+import { loadOrders } from '@/lib/orders';
 
-export async function GET(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+const STATUSES = ['PENDING', 'CONFIRMED', 'DELIVERED', 'COMPLETED', 'CANCELLED'] as const;
 
+// Statuses reachable by hand. COMPLETED is reached only by recording full payment.
+const TRANSITIONS: Record<string, string[]> = {
+    PENDING: ['CONFIRMED', 'DELIVERED', 'CANCELLED'],
+    CONFIRMED: ['DELIVERED', 'CANCELLED'],
+    DELIVERED: [],
+    COMPLETED: [],
+    CANCELLED: [],
+};
+
+export const GET = route(async (request: NextRequest) => {
+    const user = await requireUser();
     const { searchParams } = new URL(request.url);
     const id = searchParams.get('id');
+    const withAgency = isGlobalAdmin(user);
+
+    const base = {
+        agencyId: agencyScope(user),
+        customerId: user.role === 'CUSTOMER' ? user.id : undefined,
+    };
 
     if (id) {
-        const orderDoc = await adminDb.collection('orders').doc(id).get();
-        if (!orderDoc.exists) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-        
-        const orderData = orderDoc.data()!;
-        if (user.role !== 'ADMIN' && orderData.agencyId !== user.agencyId) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-        if (user.role === 'CUSTOMER' && orderData.customerId !== user.id) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-        if (user.role === 'EMPLOYEE' && orderData.employeeId && orderData.employeeId !== user.id) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-
-        // Fetch payments
-        const paymentsSnap = await adminDb.collection('payments').where('orderId', '==', id).get();
-        const payments = paymentsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-        let agency = undefined;
-        if (user.role === 'ADMIN') {
-            const agDoc = await adminDb.collection('agencies').doc(orderData.agencyId).get();
-            agency = { name: agDoc.data()?.name || 'Unknown' };
-        }
-
-        return NextResponse.json({ ...orderData, id, payments, agency });
+        const [order] = loadOrders({ ...base, id: intParam(id) }, withAgency);
+        if (!order) throw new ApiError(404, 'Not found');
+        return NextResponse.json(order);
     }
 
     const status = searchParams.get('status');
-    let ordersQuery: FirebaseFirestore.Query = adminDb.collection('orders');
+    if (status && !(STATUSES as readonly string[]).includes(status)) throw new ApiError(400, 'Invalid status');
 
-    if (user.role !== 'ADMIN') {
-        ordersQuery = ordersQuery.where('agencyId', '==', user.agencyId);
-    }
-    if (user.role === 'CUSTOMER') {
-        ordersQuery = ordersQuery.where('customerId', '==', user.id);
-    }
-    if (status) {
-        ordersQuery = ordersQuery.where('status', '==', status);
-    }
+    const { limit, offset } = pagination(searchParams);
+    return NextResponse.json(loadOrders({ ...base, status: status || undefined, limit, offset }, withAgency));
+});
 
-    const ordersSnap = await ordersQuery.orderBy('createdAt', 'desc').get();
-    let orders = await Promise.all(ordersSnap.docs.map(async doc => {
-        const data = doc.data();
-        const paymentsSnap = await adminDb.collection('payments').where('orderId', '==', doc.id).get();
-        const payments = paymentsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-        return { id: doc.id, ...data, payments };
-    }));
+const createSchema = z.object({
+    customerId: z.coerce.number().int().positive().optional(),
+    items: z
+        .array(
+            z.object({
+                productId: z.coerce.number().int().positive(),
+                quantity: z.coerce.number().int().min(1).max(100000),
+            })
+        )
+        .min(1, 'At least one item is required')
+        .max(200),
+    notes: z.string().trim().max(1000).nullish(),
+});
 
-    if (user.role === 'ADMIN') {
-        const agenciesSnapshot = await adminDb.collection('agencies').get();
-        const agenciesMap = new Map();
-        agenciesSnapshot.forEach(doc => agenciesMap.set(doc.id, doc.data()));
+export const POST = route(async (request: NextRequest) => {
+    const user = await requireUser();
+    const body = await readJson(request, createSchema);
 
-        orders = orders.map(o => ({
-            ...o,
-            agency: { name: agenciesMap.get((o as any).agencyId)?.name || 'Unknown' }
-        }));
-    }
+    // Merge duplicate lines for the same product.
+    const wanted = new Map<number, number>();
+    for (const i of body.items) wanted.set(i.productId, (wanted.get(i.productId) ?? 0) + i.quantity);
 
-    return NextResponse.json(orders);
-}
+    const create = db.transaction(() => {
+        const customerId = user.role === 'CUSTOMER' ? user.id : body.customerId;
+        if (!customerId) throw new ApiError(400, 'Customer is required');
 
-export async function POST(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+        const customer = db.prepare('SELECT id, agency_id, role FROM users WHERE id = ?').get(customerId) as
+            | { id: number; agency_id: number | null; role: string }
+            | undefined;
+        if (!customer || customer.role !== 'CUSTOMER' || customer.agency_id === null) {
+            throw new ApiError(400, 'Customer not found');
+        }
+        assertAgencyAccess(user, customer.agency_id);
+        const agencyId = customer.agency_id;
 
-    const body = await request.json();
-    const { customerId, items, notes } = body;
+        const getProduct = db.prepare('SELECT id, agency_id, name, unit, price, stock FROM products WHERE id = ?');
+        const decStock = db.prepare('UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?');
 
-    if (!items || items.length === 0) {
-        return NextResponse.json({ error: 'At least one item is required' }, { status: 400 });
-    }
-
-    try {
-        const orderData = await adminDb.runTransaction(async (t) => {
-            // Read products
-            const productDocs = await Promise.all(items.map((i: any) => t.get(adminDb.collection('products').doc(i.productId))));
-            
-            let totalAmount = 0;
-            const orderItems = [];
-
-            for (let idx = 0; idx < productDocs.length; idx++) {
-                const pDoc = productDocs[idx];
-                const item = items[idx];
-                
-                if (!pDoc.exists) throw new Error(`Product ${item.productId} not found`);
-                const product = pDoc.data()!;
-                if (product.agencyId !== user.agencyId) throw new Error(`Product ${item.productId} unauthorized`);
-
-                const price = product.price * item.quantity;
-                totalAmount += price;
-                
-                orderItems.push({
-                    productId: pDoc.id,
-                    quantity: item.quantity,
-                    price: product.price,
-                    product: { name: product.name, unit: product.unit } // denormalized for easy rendering
-                });
-
-                // Prepare stock decrement
-                t.update(pDoc.ref, { stock: (product.stock || 0) - item.quantity });
+        let totalCents = 0;
+        const lines: { productId: number; name: string; unit: string; price: number; quantity: number }[] = [];
+        for (const [productId, quantity] of wanted) {
+            const p = getProduct.get(productId) as
+                | { id: number; agency_id: number; name: string; unit: string; price: number; stock: number }
+                | undefined;
+            if (!p || p.agency_id !== agencyId) throw new ApiError(400, `Product ${productId} not found`);
+            if (decStock.run(quantity, productId, quantity).changes === 0) {
+                throw new ApiError(409, `Insufficient stock for "${p.name}" (available: ${p.stock})`);
             }
+            totalCents += toCents(p.price) * quantity;
+            lines.push({ productId, name: p.name, unit: p.unit, price: p.price, quantity });
+        }
 
-            // Fetch customer name for denormalization
-            const actualCustomerId = user.role === 'CUSTOMER' ? user.id : (customerId || user.id);
-            const customerDoc = await t.get(adminDb.collection('users').doc(actualCustomerId));
-            const customerName = customerDoc.exists ? customerDoc.data()?.name : 'Unknown';
+        const orderId = Number(
+            db
+                .prepare(
+                    `INSERT INTO orders (agency_id, customer_id, employee_id, status, total_amount, notes)
+                     VALUES (?, ?, ?, 'PENDING', ?, ?)`
+                )
+                .run(agencyId, customerId, user.role === 'EMPLOYEE' ? user.id : null, fromCents(totalCents), body.notes || null)
+                .lastInsertRowid
+        );
+        const insItem = db.prepare(
+            `INSERT INTO order_items (order_id, product_id, product_name, product_unit, quantity, price) VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        for (const l of lines) insItem.run(orderId, l.productId, l.name, l.unit, l.quantity, l.price);
+        return orderId;
+    });
 
-            let employeeName = undefined;
-            if (user.role === 'EMPLOYEE') {
-                employeeName = user.name;
-            }
+    const orderId = create();
+    const [order] = loadOrders({ id: orderId }, isGlobalAdmin(user));
+    return NextResponse.json(order, { status: 201 });
+});
 
-            const newOrderRef = adminDb.collection('orders').doc();
-            const newOrder = {
-                agencyId: user.agencyId,
-                customerId: actualCustomerId,
-                customer: { id: actualCustomerId, name: customerName },
-                employeeId: user.role === 'EMPLOYEE' ? user.id : null,
-                employee: user.role === 'EMPLOYEE' ? { id: user.id, name: employeeName } : null,
-                totalAmount,
-                notes: notes || null,
-                status: 'PENDING',
-                items: orderItems,
-                createdAt: new Date().toISOString()
-            };
+const updateSchema = z.object({
+    id: z.coerce.number().int().positive(),
+    status: z.enum(STATUSES),
+});
 
-            t.set(newOrderRef, newOrder);
-            return { id: newOrderRef.id, ...newOrder };
-        });
+export const PUT = route(async (request: NextRequest) => {
+    const user = await requireUser('ADMIN', 'EMPLOYEE');
+    const { id, status } = await readJson(request, updateSchema);
 
-        return NextResponse.json(orderData);
-    } catch (e: any) {
-        return NextResponse.json({ error: e.message }, { status: 400 });
-    }
-}
+    const update = db.transaction(() => {
+        const order = db.prepare('SELECT id, agency_id, status FROM orders WHERE id = ?').get(id) as
+            | { id: number; agency_id: number; status: string }
+            | undefined;
+        if (!order) throw new ApiError(404, 'Order not found');
+        assertAgencyAccess(user, order.agency_id);
 
-export async function PUT(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user || !['ADMIN', 'EMPLOYEE'].includes(user.role)) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 403 });
-    }
+        if (order.status === status) return;
+        if (!TRANSITIONS[order.status].includes(status)) {
+            throw new ApiError(409, `Cannot change an order from ${order.status} to ${status}`);
+        }
 
-    const body = await request.json();
-    const { id, status } = body;
-    if (!id || !status) return NextResponse.json({ error: 'ID and status required' }, { status: 400 });
+        if (status === 'CANCELLED') {
+            const paid = db.prepare('SELECT COUNT(*) AS n FROM payments WHERE order_id = ?').get(id) as { n: number };
+            if (paid.n > 0) throw new ApiError(409, 'Cannot cancel an order that already has payments');
+            // Return reserved stock.
+            db.prepare(
+                `UPDATE products SET stock = stock + (SELECT SUM(quantity) FROM order_items WHERE order_id = ? AND product_id = products.id)
+                  WHERE id IN (SELECT product_id FROM order_items WHERE order_id = ? AND product_id IS NOT NULL)`
+            ).run(id, id);
+        }
+        db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, id);
+    });
+    update();
 
-    const orderRef = adminDb.collection('orders').doc(id);
-    const orderDoc = await orderRef.get();
-    if (!orderDoc.exists) return NextResponse.json({ error: 'Order not found' }, { status: 404 });
-    if (user.role !== 'ADMIN' && orderDoc.data()?.agencyId !== user.agencyId) return NextResponse.json({ error: 'Order not found' }, { status: 404 });
-
-    await orderRef.update({ status });
     return NextResponse.json({ id, status });
-}
+});

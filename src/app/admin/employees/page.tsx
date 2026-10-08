@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { getList, mutate } from '@/lib/api';
 
 interface User {
     id: number;
@@ -25,10 +26,10 @@ export default function AdminEmployees() {
     const [editing, setEditing] = useState<User | null>(null);
     const [form, setForm] = useState({ name: '', email: '', password: '', phone: '', address: '', agencyId: '' });
 
-    const load = () => fetch('/api/users?role=EMPLOYEE').then(r => r.json()).then(setUsers);
+    const load = () => getList('/api/users?role=EMPLOYEE').then(setUsers);
     useEffect(() => {
         load();
-        fetch('/api/agencies').then(r => r.json()).then(data => setAgencies(Array.isArray(data) ? data : []));
+        getList('/api/agencies').then(setAgencies);
     }, []);
 
     const openAdd = () => { setEditing(null); setForm({ name: '', email: '', password: '', phone: '', address: '', agencyId: '' }); setShowForm(true); };
@@ -36,18 +37,19 @@ export default function AdminEmployees() {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        await fetch('/api/users', {
+        const res = await mutate('/api/users', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ...form, role: 'EMPLOYEE', id: editing?.id }),
         });
+        if (!res.ok) return;
         setShowForm(false);
         load();
     };
 
     const handleDelete = async (id: number) => {
         if (!confirm('Delete this employee?')) return;
-        await fetch(`/api/users?id=${id}`, { method: 'DELETE' });
+        await mutate(`/api/users?id=${id}`, { method: 'DELETE' });
         load();
     };
 
@@ -66,7 +68,7 @@ export default function AdminEmployees() {
                             <div className="form-group">
                                 <label>Agency</label>
                                 <select className="form-control" value={form.agencyId} onChange={e => setForm({ ...form, agencyId: e.target.value })} required={!editing}>
-                                    <option value="">— Select Agency —</option>
+                                    <option value="">- Select Agency -</option>
                                     {agencies.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                                 </select>
                             </div>
@@ -109,10 +111,10 @@ export default function AdminEmployees() {
                     <tbody>
                         {users.map(u => (
                             <tr key={u.id}>
-                                <td>{u.agency?.name || '—'}</td>
+                                <td>{u.agency?.name || '-'}</td>
                                 <td style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{u.name}</td>
                                 <td>{u.email}</td>
-                                <td>{u.phone || '—'}</td>
+                                <td>{u.phone || '-'}</td>
                                 <td>{new Date(u.createdAt).toLocaleDateString()}</td>
                                 <td>
                                     <div className="btn-group">

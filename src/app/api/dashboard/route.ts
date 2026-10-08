@@ -1,68 +1,67 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { adminDb } from '@/lib/firebase-admin';
-import * as admin from 'firebase-admin';
-import { getAuthUser } from '@/lib/auth';
+import { NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import { agencyScope, requireUser } from '@/lib/auth';
+import { route } from '@/lib/http';
+import { loadOrders } from '@/lib/orders';
 
-export async function GET(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+const count = (sql: string, ...params: unknown[]) => (db.prepare(sql).get(...params) as { n: number }).n;
+
+export const GET = route(async () => {
+    const user = await requireUser();
+    const scope = agencyScope(user);
 
     if (user.role === 'ADMIN') {
-        const [
-            productsCount, 
-            customersCount, 
-            employeesCount, 
-            ordersCount, 
-            ordersSnap, 
-            paymentsAgg
-        ] = await Promise.all([
-            adminDb.collection('products').count().get(),
-            adminDb.collection('users').where('role', '==', 'CUSTOMER').count().get(),
-            adminDb.collection('users').where('role', '==', 'EMPLOYEE').count().get(),
-            adminDb.collection('orders').count().get(),
-            adminDb.collection('orders').orderBy('createdAt', 'desc').limit(10).get(),
-            adminDb.collection('payments').aggregate({ totalAmount: admin.firestore.AggregateField.sum('amount') }).get()
-        ]);
-
-        const orders = ordersSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
+        // `? IS NULL OR agency_id = ?` lets one statement serve both the Global and per-agency admin.
+        const s = [scope, scope];
+        const stats = {
+            totalProducts: count('SELECT COUNT(*) AS n FROM products WHERE ? IS NULL OR agency_id = ?', ...s),
+            totalCustomers: count(`SELECT COUNT(*) AS n FROM users WHERE role = 'CUSTOMER' AND (? IS NULL OR agency_id = ?)`, ...s),
+            totalEmployees: count(`SELECT COUNT(*) AS n FROM users WHERE role = 'EMPLOYEE' AND (? IS NULL OR agency_id = ?)`, ...s),
+            totalOrders: count('SELECT COUNT(*) AS n FROM orders WHERE ? IS NULL OR agency_id = ?', ...s),
+            totalRevenue: (
+                db.prepare('SELECT COALESCE(SUM(amount), 0) AS n FROM payments WHERE ? IS NULL OR agency_id = ?').get(...s) as { n: number }
+            ).n,
+        };
+        const outstanding = (
+            db
+                .prepare(
+                    `SELECT COALESCE(SUM(o.total_amount), 0) - COALESCE(SUM((SELECT SUM(p.amount) FROM payments p WHERE p.order_id = o.id)), 0) AS n
+                       FROM orders o WHERE o.status != 'CANCELLED' AND (? IS NULL OR o.agency_id = ?)`
+                )
+                .get(...s) as { n: number }
+        ).n;
+        const ordersByStatus = db
+            .prepare(`SELECT status, COUNT(*) AS count FROM orders WHERE ? IS NULL OR agency_id = ? GROUP BY status`)
+            .all(...s);
+        const lowStock = db
+            .prepare(
+                `SELECT id, name, stock, unit FROM products WHERE stock <= 20 AND (? IS NULL OR agency_id = ?)
+                  ORDER BY stock ASC, name LIMIT 6`
+            )
+            .all(...s);
         return NextResponse.json({
-            stats: {
-                totalProducts: productsCount.data().count,
-                totalCustomers: customersCount.data().count,
-                totalEmployees: employeesCount.data().count,
-                totalOrders: ordersCount.data().count,
-                totalRevenue: paymentsAgg.data().totalAmount || 0,
-            },
-            recentOrders: orders,
+            stats: { ...stats, outstanding: Math.round(outstanding * 100) / 100 },
+            ordersByStatus,
+            lowStock,
+            recentOrders: loadOrders({ agencyId: scope, limit: 8 }, false),
         });
     }
 
     if (user.role === 'EMPLOYEE') {
-        const [myOrdersCount, myPaymentsAgg] = await Promise.all([
-            adminDb.collection('orders').where('employeeId', '==', user.id).where('agencyId', '==', user.agencyId).count().get(),
-            adminDb.collection('payments').where('employeeId', '==', user.id).where('agencyId', '==', user.agencyId).aggregate({ totalAmount: admin.firestore.AggregateField.sum('amount') }).get(),
-        ]);
         return NextResponse.json({
-            stats: { 
-                myOrders: myOrdersCount.data().count, 
-                myPaymentsTotal: myPaymentsAgg.data().totalAmount || 0 
+            stats: {
+                myOrders: count('SELECT COUNT(*) AS n FROM orders WHERE employee_id = ? AND agency_id = ?', user.id, user.agencyId),
+                myPaymentsTotal: (
+                    db.prepare('SELECT COALESCE(SUM(amount), 0) AS n FROM payments WHERE employee_id = ? AND agency_id = ?').get(user.id, user.agencyId) as { n: number }
+                ).n,
             },
         });
     }
 
-    if (user.role === 'CUSTOMER') {
-        const [myOrdersCount, pendingOrdersCount] = await Promise.all([
-            adminDb.collection('orders').where('customerId', '==', user.id).where('agencyId', '==', user.agencyId).count().get(),
-            adminDb.collection('orders').where('customerId', '==', user.id).where('status', '==', 'PENDING').where('agencyId', '==', user.agencyId).count().get(),
-        ]);
-        return NextResponse.json({
-            stats: { 
-                myOrders: myOrdersCount.data().count, 
-                pendingOrders: pendingOrdersCount.data().count 
-            },
-        });
-    }
-
-    return NextResponse.json({ stats: {} });
-}
+    return NextResponse.json({
+        stats: {
+            myOrders: count('SELECT COUNT(*) AS n FROM orders WHERE customer_id = ?', user.id),
+            pendingOrders: count(`SELECT COUNT(*) AS n FROM orders WHERE customer_id = ? AND status = 'PENDING'`, user.id),
+        },
+    });
+});

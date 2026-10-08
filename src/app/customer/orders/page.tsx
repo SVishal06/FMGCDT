@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { getList } from '@/lib/api';
 
 interface OrderItem {
     id: number;
@@ -23,7 +24,7 @@ export default function CustomerOrders() {
     const [selected, setSelected] = useState<Order | null>(null);
 
     useEffect(() => {
-        fetch('/api/orders').then(r => r.json()).then(setOrders);
+        getList('/api/orders').then(setOrders);
     }, []);
 
     return (

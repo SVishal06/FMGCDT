@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 import { UploadCloud } from 'lucide-react';
+import { getList, mutate } from '@/lib/api';
 
 interface User {
     id: number;
@@ -36,11 +37,11 @@ export default function AdminCustomers() {
     const [bulkResult, setBulkResult] = useState<{ success?: string, error?: string } | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const load = () => fetch('/api/users?role=CUSTOMER').then(r => r.json()).then(setUsers);
+    const load = () => getList('/api/users?role=CUSTOMER').then(setUsers);
     
     useEffect(() => { 
         load(); 
-        fetch('/api/agencies').then(r => r.json()).then(data => setAgencies(Array.isArray(data) ? data : []));
+        getList('/api/agencies').then(setAgencies);
     }, []);
 
     const openAdd = () => { setEditing(null); setForm({ name: '', email: '', password: '', phone: '', address: '', agencyId: '' }); setShowForm(true); };
@@ -48,18 +49,19 @@ export default function AdminCustomers() {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        await fetch('/api/users', {
+        const res = await mutate('/api/users', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ...form, role: 'CUSTOMER', id: editing?.id }),
         });
+        if (!res.ok) return;
         setShowForm(false);
         load();
     };
 
     const handleDelete = async (id: number) => {
         if (!confirm('Delete this customer?')) return;
-        await fetch(`/api/users?id=${id}`, { method: 'DELETE' });
+        await mutate(`/api/users?id=${id}`, { method: 'DELETE' });
         load();
     };
 
@@ -82,14 +84,14 @@ export default function AdminCustomers() {
             const data = await res.json();
             
             if (res.ok) {
-                setBulkResult({ success: `Successfully imported ${data.imported} customers. Skipped ${data.skippedRows || 0} invalid rows.` });
+                setBulkResult({ success: `Successfully imported ${data.imported} customers. Skipped ${data.skippedRows || 0} invalid or duplicate rows. Initial password for imported customers: ${data.initialPassword}` });
                 setBulkFile(null);
                 if (fileInputRef.current) fileInputRef.current.value = '';
                 load();
             } else {
                 setBulkResult({ error: data.error || 'Failed to upload' });
             }
-        } catch (err) {
+        } catch {
             setBulkResult({ error: 'Something went wrong during upload' });
         } finally {
             setBulkLoading(false);
@@ -124,7 +126,7 @@ export default function AdminCustomers() {
                             <div className="form-group">
                                 <label>Agency</label>
                                 <select className="form-control" value={form.agencyId} onChange={e => setForm({ ...form, agencyId: e.target.value })} required={!editing}>
-                                    <option value="">— Select Agency —</option>
+                                    <option value="">- Select Agency -</option>
                                     {agencies.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                                 </select>
                             </div>
@@ -173,7 +175,7 @@ export default function AdminCustomers() {
                             <div className="form-group">
                                 <label>Assign to Agency</label>
                                 <select className="form-control" value={bulkAgency} onChange={e => setBulkAgency(e.target.value)} required>
-                                    <option value="">— Select Agency —</option>
+                                    <option value="">- Select Agency -</option>
                                     {agencies.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                                 </select>
                             </div>
@@ -220,11 +222,11 @@ export default function AdminCustomers() {
                     <tbody>
                         {users.map(u => (
                             <tr key={u.id}>
-                                <td>{u.agency?.name || '—'}</td>
+                                <td>{u.agency?.name || '-'}</td>
                                 <td style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{u.name}</td>
                                 <td>{u.email}</td>
-                                <td>{u.phone || '—'}</td>
-                                <td>{u.address || '—'}</td>
+                                <td>{u.phone || '-'}</td>
+                                <td>{u.address || '-'}</td>
                                 <td>
                                     <div className="btn-group">
                                         <button className="btn btn-secondary btn-sm" onClick={() => openEdit(u)}>Edit</button>

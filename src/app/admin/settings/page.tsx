@@ -14,7 +14,7 @@ interface UserInfo {
 }
 
 export default function AdminSettings() {
-    const [form, setForm] = useState({ name: '', themeColor: '#0066cc' });
+    const [form, setForm] = useState({ name: '', themeColor: '#2c4bb5' });
     const [success, setSuccess] = useState('');
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
@@ -22,10 +22,18 @@ export default function AdminSettings() {
     // Global Admin agency management
     const [isGlobalAdmin, setIsGlobalAdmin] = useState(false);
     const [agencies, setAgencies] = useState<Agency[]>([]);
-    const [newAgency, setNewAgency] = useState({ name: '', themeColor: '#0066cc' });
+    const [newAgency, setNewAgency] = useState({ name: '', themeColor: '#2c4bb5' });
     const [agencyLoading, setAgencyLoading] = useState(false);
     const [agencyError, setAgencyError] = useState('');
     const [agencySuccess, setAgencySuccess] = useState('');
+
+    const fetchAgencies = () => {
+        fetch('/api/agencies')
+            .then(r => r.json())
+            .then((data: Agency[]) => {
+                if (Array.isArray(data)) setAgencies(data);
+            });
+    };
 
     useEffect(() => {
         // Check if current user is a Global Admin (agencyId === 0 means null in DB)
@@ -49,14 +57,6 @@ export default function AdminSettings() {
         });
     }, []);
 
-    const fetchAgencies = () => {
-        fetch('/api/agencies')
-            .then(r => r.json())
-            .then((data: Agency[]) => {
-                if (Array.isArray(data)) setAgencies(data);
-            });
-    };
-
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         setError('');
@@ -70,7 +70,7 @@ export default function AdminSettings() {
         });
 
         if (res.ok) {
-            setSuccess('Settings saved! You must log out and log back in to see the color change across all pages since the theme color is embedded in your session.');
+            setSuccess('Settings saved! Reload the page to see the new accent colour.');
         } else {
             const data = await res.json();
             setError(data.error || 'Failed to update settings');
@@ -95,7 +95,7 @@ export default function AdminSettings() {
 
             if (res.ok) {
                 setAgencySuccess(`Agency "${data.name}" created successfully!`);
-                setNewAgency({ name: '', themeColor: '#0066cc' });
+                setNewAgency({ name: '', themeColor: '#2c4bb5' });
                 fetchAgencies();
             } else {
                 setAgencyError(data.error || 'Failed to create agency');

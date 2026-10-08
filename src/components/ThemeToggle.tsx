@@ -1,41 +1,25 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { Moon, Sun } from 'lucide-react';
+import { useSyncExternalStore } from 'react';
 import { useTheme } from 'next-themes';
 
 export function ThemeToggle() {
-  const [mounted, setMounted] = useState(false);
-  const { theme, setTheme, resolvedTheme } = useTheme();
+  // false during SSR/hydration, true on the client: avoids an icon mismatch without an effect.
+  const mounted = useSyncExternalStore(() => () => {}, () => true, () => false);
+  const { setTheme, resolvedTheme } = useTheme();
 
-  useEffect(() => {
-    setMounted(true);
-  }, []);
-
-  if (!mounted) {
-    return <div style={{ width: '38px', height: '38px' }} />;
-  }
+  if (!mounted) return <div className="w-9 h-9" />;
 
   const isDark = resolvedTheme === 'dark';
-
   return (
     <button
       onClick={() => setTheme(isDark ? 'light' : 'dark')}
       className="btn btn-secondary"
-      style={{
-        padding: '10px',
-        borderRadius: '50%',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        width: '38px',
-        height: '38px',
-        border: '1px solid var(--border)'
-      }}
-      aria-label="Toggle theme"
-      title="Toggle theme"
+      style={{ width: 36, padding: 0 }}
+      aria-label={isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+      title={isDark ? 'Light theme' : 'Dark theme'}
     >
-      {isDark ? <Sun size={18} /> : <Moon size={18} />}
+      <span className="material-symbols-outlined">{isDark ? 'light_mode' : 'dark_mode'}</span>
     </button>
   );
 }
