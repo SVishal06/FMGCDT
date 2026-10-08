@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { adminAuth, adminDb } from '@/lib/firebase-admin';
-import { getAuthUser } from '@/lib/auth';
+import crypto from 'node:crypto';
+import { db } from '@/lib/db';
+import { agencyScope, hashPassword, requireUser } from '@/lib/auth';
+import { ApiError, route } from '@/lib/http';
 import * as XLSX from 'xlsx';
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_ROWS = 20000;
 
 interface ParsedCustomer {
     name: string;
@@ -10,23 +15,20 @@ interface ParsedCustomer {
     email: string;
 }
 
-export async function POST(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user || user.role !== 'ADMIN') {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 403 });
-    }
+export const POST = route(async (request: NextRequest) => {
+    const user = await requireUser('ADMIN');
 
-    try {
+    {
         const formData = await request.formData();
         const file = formData.get('file') as File;
-        const agencyId = formData.get('agencyId') as string;
+        const scope = agencyScope(user);
+        const agencyId = scope ?? Number(formData.get('agencyId'));
 
-        if (!file) {
-            return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
-        }
-        if (!agencyId) {
-            return NextResponse.json({ error: 'Agency selection is required' }, { status: 400 });
-        }
+        if (!file || typeof file === 'string') throw new ApiError(400, 'No file uploaded');
+        if (!Number.isInteger(agencyId) || agencyId <= 0) throw new ApiError(400, 'Agency selection is required');
+        if (!db.prepare('SELECT 1 FROM agencies WHERE id = ?').get(agencyId)) throw new ApiError(400, 'Agency not found');
+        if (file.size > MAX_FILE_BYTES) throw new ApiError(413, 'File too large (max 5 MB)');
+        if (!/\.(xlsx|xls|csv)$/i.test(file.name)) throw new ApiError(400, 'Only .xlsx, .xls or .csv files are supported');
 
         const buffer = await file.arrayBuffer();
         const workbook = XLSX.read(buffer, { type: 'array' });
@@ -34,6 +36,7 @@ export async function POST(request: NextRequest) {
         const sheet = workbook.Sheets[sheetName];
 
         const rawRows: (string | number | null | undefined)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+        if (rawRows.length > MAX_ROWS) throw new ApiError(413, `Too many rows (max ${MAX_ROWS})`);
 
         const customers: ParsedCustomer[] = [];
         let skippedRows = 0;
@@ -84,7 +87,7 @@ export async function POST(request: NextRequest) {
             }
 
             const phone = mobile || telephone || '';
-            const finalEmail = email || `customer_${Date.now()}_${Math.floor(Math.random() * 10000)}@dummy.fmcg.com`;
+            const finalEmail = (email || `customer_${crypto.randomUUID()}@dummy.fmcg.com`).toLowerCase();
 
             customers.push({ name, address, phone, email: finalEmail });
         }
@@ -96,48 +99,29 @@ export async function POST(request: NextRequest) {
             }, { status: 400 });
         }
 
-        const defaultPassword = 'password123';
+        // Imported customers get BULK_DEFAULT_PASSWORD (or a random one if unset) and should change it.
+        const defaultPassword = process.env.BULK_DEFAULT_PASSWORD || crypto.randomBytes(9).toString('base64url');
+        const hash = await hashPassword(defaultPassword);
+        const insert = db.prepare(
+            `INSERT OR IGNORE INTO users (agency_id, name, email, password_hash, role, phone, address) VALUES (?, ?, ?, ?, 'CUSTOMER', ?, ?)`
+        );
         let imported = 0;
-
-        // Iterate sequentially or chunked to avoid hitting Firebase Auth rate limits
-        for (const c of customers) {
-            try {
-                const userRecord = await adminAuth.createUser({
-                    email: c.email,
-                    password: defaultPassword,
-                    displayName: c.name,
-                });
-
-                await adminAuth.setCustomUserClaims(userRecord.uid, { role: 'CUSTOMER', agencyId: String(agencyId) });
-
-                await adminDb.collection('users').doc(userRecord.uid).set({
-                    agencyId: String(agencyId),
-                    role: 'CUSTOMER',
-                    name: c.name,
-                    email: c.email,
-                    phone: c.phone || null,
-                    address: c.address || null,
-                    createdAt: new Date().toISOString()
-                });
-                imported++;
-            } catch (err: any) {
-                if (err.code === 'auth/email-already-exists') {
-                    skippedRows++;
-                } else {
-                    console.error('Error importing customer', c.email, err);
-                }
+        db.transaction(() => {
+            for (const c of customers) {
+                // OR IGNORE: duplicate emails are skipped instead of aborting the import.
+                if (insert.run(agencyId, c.name, c.email, hash, c.phone || null, c.address || null).changes) imported++;
+                else skippedRows++;
             }
-        }
+        })();
 
         return NextResponse.json({
             success: true,
             imported,
             total: customers.length,
-            skippedRows
+            skippedRows,
+            // Shown once so the admin can hand it out; never stored in plain text.
+            initialPassword: defaultPassword,
         });
 
-    } catch (err) {
-        console.error('Bulk upload error:', err);
-        return NextResponse.json({ error: 'Failed to process file. Please check the format.' }, { status: 500 });
     }
-}
+});

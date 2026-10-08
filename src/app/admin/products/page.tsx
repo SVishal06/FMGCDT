@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 import { UploadCloud } from 'lucide-react';
+import { getList, mutate } from '@/lib/api';
 
 interface Product {
     id: number;
@@ -36,11 +37,11 @@ export default function AdminProducts() {
     const [bulkResult, setBulkResult] = useState<{ success?: string, error?: string } | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const load = () => fetch('/api/products').then(r => r.json()).then(setProducts);
+    const load = () => getList('/api/products').then(setProducts);
 
     useEffect(() => {
         load();
-        fetch('/api/agencies').then(r => r.json()).then(data => setAgencies(Array.isArray(data) ? data : []));
+        getList('/api/agencies').then(setAgencies);
     }, []);
 
     const openAdd = () => { setEditing(null); setForm({ name: '', description: '', price: '', stock: '', unit: 'pcs', category: '', agencyId: '' }); setShowForm(true); };
@@ -48,18 +49,19 @@ export default function AdminProducts() {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        await fetch('/api/products', {
+        const res = await mutate('/api/products', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ...form, id: editing?.id }),
         });
+        if (!res.ok) return;
         setShowForm(false);
         load();
     };
 
     const handleDelete = async (id: number) => {
         if (!confirm('Delete this product?')) return;
-        await fetch(`/api/products?id=${id}`, { method: 'DELETE' });
+        await mutate(`/api/products?id=${id}`, { method: 'DELETE' });
         load();
     };
 
@@ -89,7 +91,7 @@ export default function AdminProducts() {
             } else {
                 setBulkResult({ error: data.error || 'Failed to upload' });
             }
-        } catch (err) {
+        } catch {
             setBulkResult({ error: 'Something went wrong during upload' });
         } finally {
             setBulkLoading(false);
@@ -127,7 +129,7 @@ export default function AdminProducts() {
                             <div className="form-group">
                                 <label>Agency</label>
                                 <select className="form-control" value={form.agencyId} onChange={e => setForm({ ...form, agencyId: e.target.value })} required={!editing}>
-                                    <option value="">— Select Agency —</option>
+                                    <option value="">- Select Agency -</option>
                                     {agencies.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                                 </select>
                             </div>
@@ -184,7 +186,7 @@ export default function AdminProducts() {
                             <div className="form-group">
                                 <label>Assign to Agency</label>
                                 <select className="form-control" value={bulkAgency} onChange={e => setBulkAgency(e.target.value)} required>
-                                    <option value="">— Select Agency —</option>
+                                    <option value="">- Select Agency -</option>
                                     {agencies.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                                 </select>
                             </div>
@@ -239,9 +241,9 @@ export default function AdminProducts() {
                     <tbody>
                         {products.map(p => (
                             <tr key={p.id}>
-                                <td>{p.agency?.name || '—'}</td>
+                                <td>{p.agency?.name || '-'}</td>
                                 <td style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{p.name}</td>
-                                <td>{p.category || '—'}</td>
+                                <td>{p.category || '-'}</td>
                                 <td>₹{p.price}</td>
                                 <td>{p.stock}</td>
                                 <td>{p.unit}</td>

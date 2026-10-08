@@ -7,23 +7,28 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "postinstall": "echo 'Prisma removed'"
+    "typecheck": "tsc --noEmit",
+    "seed": "node db/seed.js",
+    "test": "node --test tests/api.test.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
     "dotenv": "^17.3.1",
-    "firebase": "^12.14.0",
-    "firebase-admin": "^13.10.0",
+    "geist": "^1.7.2",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.577.0",
+    "material-symbols": "^0.47.6",
     "next": "16.1.6",
     "next-themes": "^0.4.6",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20",
     "@types/react": "^19",

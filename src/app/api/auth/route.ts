@@ -1,143 +1,100 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { adminAuth, adminDb } from '@/lib/firebase-admin';
+import { z } from 'zod';
+import { db } from '@/lib/db';
+import {
+    DUMMY_HASH, SESSION_COOKIE, SESSION_MAX_AGE, getAuthUser, hashPassword, signSession, toAuthUser, verifyPassword,
+} from '@/lib/auth';
+import { ApiError, clientIp, rateLimit, rateLimitReset, readJson, route } from '@/lib/http';
 
-export async function POST(request: NextRequest) {
-    const body = await request.json();
-    const { action, name, email, password, role, agencyId, idToken } = body;
+const email = z.string().trim().toLowerCase().email().max(254);
+const password = z.string().min(8, 'must be at least 8 characters').max(128);
 
-    if (action === 'register') {
-        if (!name || !email || !password || !agencyId) {
-            return NextResponse.json({ error: 'All fields are required' }, { status: 400 });
-        }
+const bodySchema = z.discriminatedUnion('action', [
+    z.object({ action: z.literal('login'), email, password: z.string().min(1).max(128) }),
+    z.object({
+        action: z.literal('register'),
+        name: z.string().trim().min(1).max(100),
+        email,
+        password,
+        agencyId: z.coerce.number().int().positive(),
+    }),
+    z.object({ action: z.literal('logout') }),
+    z.object({ action: z.literal('me') }),
+]);
 
-        const agencyIdStr = String(agencyId);
-        
-        // Check if email exists in this agency (we allow same email in different agencies? Firebase Auth requires globally unique emails unless we use identity platform multitenancy, but let's assume globally unique for simplicity)
-        try {
-            await adminAuth.getUserByEmail(email);
-            return NextResponse.json({ error: 'Email already registered' }, { status: 400 });
-        } catch (e: any) {
-            // User does not exist, we can proceed
-            if (e.code !== 'auth/user-not-found') {
-                return NextResponse.json({ error: 'Error checking user' }, { status: 500 });
-            }
-        }
+interface LoginRow {
+    id: number;
+    agency_id: number | null;
+    name: string;
+    email: string;
+    role: 'ADMIN' | 'EMPLOYEE' | 'CUSTOMER';
+    password_hash: string;
+    token_version: number;
+    theme_color: string | null;
+}
 
-        if (role && role.toUpperCase() === 'ADMIN') {
-            return NextResponse.json({ error: 'Admin registration is not allowed.' }, { status: 403 });
-        }
+function publicUser(row: LoginRow) {
+    const u = toAuthUser(row);
+    return { id: u.id, agencyId: u.agencyId, themeColor: u.themeColor, name: u.name, email: u.email, role: u.role };
+}
 
-        const validRole = role && ['CUSTOMER', 'EMPLOYEE'].includes(role.toUpperCase()) ? role.toUpperCase() : 'CUSTOMER';
+function sessionResponse(request: NextRequest, row: LoginRow) {
+    const response = NextResponse.json({ success: true, user: publicUser(row) });
+    const secure = request.nextUrl.protocol === 'https:' || request.headers.get('x-forwarded-proto') === 'https';
+    response.cookies.set(SESSION_COOKIE, signSession(row.id, row.token_version), {
+        httpOnly: true,
+        secure,
+        sameSite: 'lax',
+        maxAge: SESSION_MAX_AGE,
+        path: '/',
+    });
+    return response;
+}
 
-        try {
-            const userRecord = await adminAuth.createUser({
-                email,
-                password,
-                displayName: name,
-            });
+const findByEmail = db.prepare(
+    `SELECT u.id, u.agency_id, u.name, u.email, u.role, u.password_hash, u.token_version, a.theme_color
+       FROM users u LEFT JOIN agencies a ON a.id = u.agency_id WHERE u.email = ?`
+);
 
-            // Set custom claims (optional, but good for security rules)
-            await adminAuth.setCustomUserClaims(userRecord.uid, { role: validRole, agencyId: agencyIdStr });
+export const POST = route(async (request: NextRequest) => {
+    const body = await readJson(request, bodySchema);
 
-            // Store user in Firestore
-            await adminDb.collection('users').doc(userRecord.uid).set({
-                agencyId: agencyIdStr,
-                name,
-                email,
-                role: validRole,
-                createdAt: new Date().toISOString()
-            });
+    if (body.action === 'login') {
+        const limitKey = `login:${clientIp(request)}:${body.email}`;
+        rateLimit(limitKey, 10, 15 * 60 * 1000);
 
-            // We cannot automatically sign them in server-side with Firebase Admin.
-            // The client will need to sign in using the Firebase Client SDK.
-            return NextResponse.json({
-                success: true,
-                message: 'Registration successful. Please log in.',
-                user: { id: userRecord.uid, agencyId: agencyIdStr, name, email, role: validRole },
-            });
-        } catch (error: any) {
-            return NextResponse.json({ error: error.message }, { status: 500 });
-        }
+        const row = findByEmail.get(body.email) as LoginRow | undefined;
+        const ok = await verifyPassword(body.password, row?.password_hash ?? DUMMY_HASH);
+        if (!row || !ok) throw new ApiError(401, 'Invalid email or password');
+
+        rateLimitReset(limitKey);
+        return sessionResponse(request, row);
     }
 
-    if (action === 'session') {
-        if (!idToken) {
-            return NextResponse.json({ error: 'ID token is required' }, { status: 400 });
+    if (body.action === 'register') {
+        rateLimit(`register:${clientIp(request)}`, 10, 60 * 60 * 1000);
+
+        if (!db.prepare('SELECT 1 FROM agencies WHERE id = ?').get(body.agencyId)) {
+            throw new ApiError(400, 'Selected agency does not exist');
         }
+        if (findByEmail.get(body.email)) throw new ApiError(409, 'Email already registered');
 
-        try {
-            // Verify the ID token and get the UID
-            const decodedToken = await adminAuth.verifyIdToken(idToken);
-            
-            // Create a session cookie (expires in 7 days)
-            const expiresIn = 60 * 60 * 24 * 7 * 1000;
-            const sessionCookie = await adminAuth.createSessionCookie(idToken, { expiresIn });
-
-            // Fetch user data to return to client
-            const userDoc = await adminDb.collection('users').doc(decodedToken.uid).get();
-            const userData = userDoc.exists ? userDoc.data() : {};
-
-            const response = NextResponse.json({
-                success: true,
-                user: { id: decodedToken.uid, ...userData }
-            });
-
-            response.cookies.set('session', sessionCookie, {
-                httpOnly: true,
-                secure: process.env.NODE_ENV === 'production',
-                sameSite: 'lax',
-                maxAge: 60 * 60 * 24 * 7,
-                path: '/',
-            });
-
-            return response;
-        } catch (error) {
-            return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
-        }
+        // Public sign-up always creates a CUSTOMER; employees/admins are created by an admin.
+        const hash = await hashPassword(body.password);
+        db
+            .prepare(`INSERT INTO users (agency_id, name, email, password_hash, role) VALUES (?, ?, ?, ?, 'CUSTOMER')`)
+            .run(body.agencyId, body.name, body.email, hash);
+        const row = findByEmail.get(body.email) as LoginRow;
+        return sessionResponse(request, row);
     }
 
-    if (action === 'logout') {
+    if (body.action === 'logout') {
         const response = NextResponse.json({ success: true });
-        response.cookies.delete('session');
+        response.cookies.delete(SESSION_COOKIE);
         return response;
     }
 
-    if (action === 'me') {
-        const sessionCookie = request.cookies.get('session')?.value;
-        if (!sessionCookie) {
-            return NextResponse.json({ user: null });
-        }
-        
-        try {
-            const decodedClaims = await adminAuth.verifySessionCookie(sessionCookie, true);
-            const userDoc = await adminDb.collection('users').doc(decodedClaims.uid).get();
-
-            if (!userDoc.exists) return NextResponse.json({ user: null });
-
-            const userData = userDoc.data();
-            
-            let themeColor = '#006591';
-            if (userData?.agencyId && userData.agencyId !== '0') {
-                const agencyDoc = await adminDb.collection('agencies').doc(userData.agencyId).get();
-                if (agencyDoc.exists) {
-                    themeColor = agencyDoc.data()?.themeColor || themeColor;
-                }
-            }
-
-            return NextResponse.json({
-                user: {
-                    id: decodedClaims.uid,
-                    agencyId: userData?.agencyId,
-                    themeColor,
-                    name: userData?.name,
-                    email: userData?.email,
-                    role: userData?.role,
-                }
-            });
-        } catch (error) {
-            return NextResponse.json({ user: null });
-        }
-    }
-
-    return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
-}
+    // me
+    const user = await getAuthUser();
+    return NextResponse.json({ user });
+});

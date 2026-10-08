@@ -1,83 +1,102 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { adminDb } from '@/lib/firebase-admin';
-import { getAuthUser } from '@/lib/auth';
+import { z } from 'zod';
+import { db } from '@/lib/db';
+import { agencyScope, assertAgencyAccess, isGlobalAdmin, requireUser } from '@/lib/auth';
+import { ApiError, intParam, pagination, readJson, route } from '@/lib/http';
 
-export async function GET() {
-    const user = await getAuthUser();
-    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-    try {
-        let productsRef: FirebaseFirestore.Query = adminDb.collection('products');
-        
-        if (user.role !== 'ADMIN') {
-            productsRef = productsRef.where('agencyId', '==', user.agencyId);
-        }
-
-        const snapshot = await productsRef.orderBy('createdAt', 'desc').get();
-        let products = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-        if (user.role === 'ADMIN') {
-            const agenciesSnapshot = await adminDb.collection('agencies').get();
-            const agenciesMap = new Map();
-            agenciesSnapshot.forEach(doc => agenciesMap.set(doc.id, doc.data()));
-
-            products = products.map(p => ({
-                ...p,
-                agency: { name: agenciesMap.get((p as any).agencyId)?.name || 'Unknown' }
-            }));
-        }
-
-        return NextResponse.json(products);
-    } catch (error) {
-        console.error(error);
-        return NextResponse.json({ error: 'Failed to fetch products' }, { status: 500 });
-    }
+interface ProductRow {
+    id: number;
+    agency_id: number;
+    name: string;
+    description: string | null;
+    price: number;
+    stock: number;
+    unit: string;
+    category: string | null;
+    created_at: string;
+    agency_name: string;
 }
 
-export async function POST(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user || user.role !== 'ADMIN') return NextResponse.json({ error: 'Unauthorized' }, { status: 403 });
+const toProduct = (r: ProductRow, withAgency: boolean) => ({
+    id: r.id,
+    agencyId: r.agency_id,
+    name: r.name,
+    description: r.description,
+    price: r.price,
+    stock: r.stock,
+    unit: r.unit,
+    category: r.category,
+    createdAt: r.created_at,
+    ...(withAgency ? { agency: { name: r.agency_name } } : {}),
+});
 
-    const body = await request.json();
-    const { id, name, description, price, stock, unit, category, agencyId } = body;
-    if (!name || price === undefined) return NextResponse.json({ error: 'Name and price required' }, { status: 400 });
+const SELECT = `SELECT p.*, a.name AS agency_name FROM products p JOIN agencies a ON a.id = p.agency_id`;
 
-    if (!id && !agencyId) return NextResponse.json({ error: 'Agency selection is required' }, { status: 400 });
+export const GET = route(async (request: NextRequest) => {
+    const user = await requireUser();
+    const scope = agencyScope(user);
+    const { limit, offset } = pagination(new URL(request.url).searchParams);
 
-    try {
-        if (id) {
-            const updateData: any = { name, description, price: parseFloat(price), stock: parseInt(stock), unit, category };
-            if (agencyId) updateData.agencyId = String(agencyId);
+    const rows = db
+        .prepare(`${SELECT} ${scope !== null ? 'WHERE p.agency_id = ?' : ''} ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`)
+        .all(...(scope !== null ? [scope] : []), limit, offset) as ProductRow[];
 
-            await adminDb.collection('products').doc(id).update(updateData);
-            return NextResponse.json({ id, ...updateData });
-        } else {
-            const newProduct = {
-                agencyId: String(agencyId),
-                name,
-                description: description || null,
-                price: parseFloat(price),
-                stock: parseInt(stock) || 0,
-                unit: unit || 'pcs',
-                category: category || null,
-                createdAt: new Date().toISOString()
-            };
-            const docRef = await adminDb.collection('products').add(newProduct);
-            return NextResponse.json({ id: docRef.id, ...newProduct });
-        }
-    } catch (error) {
-        return NextResponse.json({ error: 'Failed to save product' }, { status: 500 });
+    const withAgency = isGlobalAdmin(user);
+    return NextResponse.json(rows.map(r => toProduct(r, withAgency)));
+});
+
+const text = (max: number) =>
+    z.string().trim().max(max).nullish().transform(v => (v ? v : null));
+
+const productSchema = z.object({
+    id: z.coerce.number().int().positive().optional(),
+    name: z.string().trim().min(1).max(200),
+    description: text(1000),
+    price: z.coerce.number().min(0).max(100_000_000),
+    stock: z.coerce.number().int().min(0).max(100_000_000).default(0),
+    unit: z.string().trim().min(1).max(30).default('pcs'),
+    category: text(100),
+    agencyId: z.coerce.number().int().positive().optional(),
+});
+
+export const POST = route(async (request: NextRequest) => {
+    const user = await requireUser('ADMIN');
+    const body = await readJson(request, productSchema);
+    const price = Math.round(body.price * 100) / 100;
+
+    if (body.id) {
+        const existing = db.prepare('SELECT id, agency_id FROM products WHERE id = ?').get(body.id) as
+            | { id: number; agency_id: number }
+            | undefined;
+        if (!existing) throw new ApiError(404, 'Product not found');
+        assertAgencyAccess(user, existing.agency_id);
+
+        // A product's agency is fixed: order history and stock belong to it.
+        db.prepare(
+            `UPDATE products SET name = ?, description = ?, price = ?, stock = ?, unit = ?, category = ? WHERE id = ?`
+        ).run(body.name, body.description, price, body.stock, body.unit, body.category, body.id);
+        return NextResponse.json({ id: body.id, ...body, price, agencyId: existing.agency_id });
     }
-}
 
-export async function DELETE(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user || user.role !== 'ADMIN') return NextResponse.json({ error: 'Unauthorized' }, { status: 403 });
+    const agencyId = agencyScope(user) ?? body.agencyId;
+    if (!agencyId) throw new ApiError(400, 'Agency selection is required');
+    if (!db.prepare('SELECT 1 FROM agencies WHERE id = ?').get(agencyId)) throw new ApiError(400, 'Agency not found');
 
-    const { searchParams } = new URL(request.url);
-    const id = searchParams.get('id');
-    if (!id) return NextResponse.json({ error: 'ID required' }, { status: 400 });
+    const info = db
+        .prepare(`INSERT INTO products (agency_id, name, description, price, stock, unit, category) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(agencyId, body.name, body.description, price, body.stock, body.unit, body.category);
+    return NextResponse.json({ id: Number(info.lastInsertRowid), ...body, price, agencyId }, { status: 201 });
+});
 
-    await adminDb.collection('products').doc(id).delete();
+export const DELETE = route(async (request: NextRequest) => {
+    const user = await requireUser('ADMIN');
+    const id = intParam(new URL(request.url).searchParams.get('id'));
+
+    const existing = db.prepare('SELECT agency_id FROM products WHERE id = ?').get(id) as { agency_id: number } | undefined;
+    if (!existing) throw new ApiError(404, 'Product not found');
+    assertAgencyAccess(user, existing.agency_id);
+
+    // Past order lines keep their name/unit/price snapshot (product_id becomes NULL).
+    db.prepare('DELETE FROM products WHERE id = ?').run(id);
     return NextResponse.json({ success: true });
-}
+});

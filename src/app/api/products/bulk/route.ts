@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { adminDb } from '@/lib/firebase-admin';
-import { getAuthUser } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { agencyScope, requireUser } from '@/lib/auth';
+import { ApiError, route } from '@/lib/http';
 import * as XLSX from 'xlsx';
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_ROWS = 20000;
 
 interface ParsedProduct {
     name: string;
@@ -11,23 +15,20 @@ interface ParsedProduct {
     category: string;
 }
 
-export async function POST(request: NextRequest) {
-    const user = await getAuthUser();
-    if (!user || user.role !== 'ADMIN') {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 403 });
-    }
+export const POST = route(async (request: NextRequest) => {
+    const user = await requireUser('ADMIN');
 
-    try {
+    {
         const formData = await request.formData();
         const file = formData.get('file') as File;
-        const agencyId = formData.get('agencyId') as string;
+        const scope = agencyScope(user);
+        const agencyId = scope ?? Number(formData.get('agencyId'));
 
-        if (!file) {
-            return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
-        }
-        if (!agencyId) {
-            return NextResponse.json({ error: 'Agency selection is required' }, { status: 400 });
-        }
+        if (!file || typeof file === 'string') throw new ApiError(400, 'No file uploaded');
+        if (!Number.isInteger(agencyId) || agencyId <= 0) throw new ApiError(400, 'Agency selection is required');
+        if (!db.prepare('SELECT 1 FROM agencies WHERE id = ?').get(agencyId)) throw new ApiError(400, 'Agency not found');
+        if (file.size > MAX_FILE_BYTES) throw new ApiError(413, 'File too large (max 5 MB)');
+        if (!/\.(xlsx|xls|csv)$/i.test(file.name)) throw new ApiError(400, 'Only .xlsx, .xls or .csv files are supported');
 
         const buffer = await file.arrayBuffer();
         const workbook = XLSX.read(buffer, { type: 'array' });
@@ -35,6 +36,7 @@ export async function POST(request: NextRequest) {
         const sheet = workbook.Sheets[sheetName];
 
         const rawRows: (string | number | null | undefined)[][] = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+        if (rawRows.length > MAX_ROWS) throw new ApiError(413, `Too many rows (max ${MAX_ROWS})`);
 
         const products: ParsedProduct[] = [];
         let currentCategory = '';
@@ -113,36 +115,15 @@ export async function POST(request: NextRequest) {
             }, { status: 400 });
         }
 
-        // Firestore batch write (max 500 per batch)
-        const batches = [];
-        let currentBatch = adminDb.batch();
-        let count = 0;
-
-        for (const p of products) {
-            const docRef = adminDb.collection('products').doc();
-            currentBatch.set(docRef, {
-                agencyId: String(agencyId),
-                name: p.name,
-                price: p.price,
-                stock: p.stock,
-                unit: p.unit,
-                category: p.category,
-                createdAt: new Date().toISOString()
-            });
-
-            count++;
-            if (count === 500) {
-                batches.push(currentBatch.commit());
-                currentBatch = adminDb.batch();
-                count = 0;
-            }
-        }
-
-        if (count > 0) {
-            batches.push(currentBatch.commit());
-        }
-
-        await Promise.all(batches);
+        // One transaction: all rows import or none do. Re-importing updates existing products by name.
+        const upsert = db.prepare(
+            `INSERT INTO products (agency_id, name, price, stock, unit, category) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (agency_id, name) DO UPDATE SET price = excluded.price, stock = excluded.stock,
+                                                        unit = excluded.unit, category = excluded.category`
+        );
+        db.transaction(() => {
+            for (const p of products) upsert.run(agencyId, p.name, p.price, Math.max(p.stock, 0), p.unit, p.category);
+        })();
 
         return NextResponse.json({
             success: true,
@@ -152,8 +133,5 @@ export async function POST(request: NextRequest) {
             categories: [...new Set(products.map(p => p.category))],
         });
 
-    } catch (err) {
-        console.error('Bulk upload error:', err);
-        return NextResponse.json({ error: 'Failed to process file. Please check the format.' }, { status: 500 });
     }
-}
+});
